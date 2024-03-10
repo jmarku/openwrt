@@ -69,19 +69,24 @@ struct bootcounter {
 	uint32_t checksum;
 };
 
-static char page[2048];
 
 int mtd_resetbc(const char *mtd)
 {
 	struct mtd_info_user mtd_info;
-	struct bootcounter *curr = (struct bootcounter *)page;
+	struct erase_info_user erase_info;
+	struct bootcounter *curr;
 	unsigned int i;
 	unsigned int bc_offset_increment;
 	int last_count = 0;
 	int num_bc;
+	char *page;
+	int page_num_bc;
+	int page_len;
 	int fd;
 	int ret;
 	int retval = 0;
+	int erase_size;
+	size_t erase_start = 0;
 
 	DLOG_OPEN();
 
@@ -107,10 +112,32 @@ int mtd_resetbc(const char *mtd)
 		bc_offset_increment = mtd_info.writesize;
 	}
 
+	if (mtd_info.erasesize < bc_offset_increment) {
+		erase_size = bc_offset_increment;
+		DLOG_DEBUG("Erase size set to %i for erasesize of %i",
+			   erase_size, mtd_info.erasesize);
+	}
+	else {
+		erase_size = mtd_info.erasesize;
+	}
+
+	page_num_bc = erase_size / bc_offset_increment;
+	page = malloc(erase_size);
+	if (page == NULL) {
+		DLOG_ERR("Unable to allocate memory (%i)", erase_size);
+		retval = -2;
+		goto out;
+	}
 	num_bc = mtd_info.size / bc_offset_increment;
 
+	page_len = 0;
 	for (i = 0; i < num_bc; i++) {
+		curr = (struct bootcounter *)(page + page_len * bc_offset_increment);
 		pread(fd, curr, sizeof(*curr), i * bc_offset_increment);
+		if (++page_len >= page_num_bc) {
+			page_len = 0;
+			erase_start += erase_size;
+		}
 
 		/* Existing code assumes erase is to 0xff; left as-is (2019) */
 
@@ -119,7 +146,7 @@ int mtd_resetbc(const char *mtd)
 			DLOG_ERR("Unexpected magic %08x at offset %08x; aborting.",
 				 curr->magic, i * bc_offset_increment);
 
-			retval = -2;
+			retval = -3;
 			goto out;
 		}
 
@@ -141,7 +168,6 @@ int mtd_resetbc(const char *mtd)
 		DLOG_NOTICE("Boot-count log full with %i entries; erasing (expected occasionally).",
 			    i);
 
-		struct erase_info_user erase_info;
 		erase_info.start = 0;
 		erase_info.length = mtd_info.size;
 
@@ -150,11 +176,27 @@ int mtd_resetbc(const char *mtd)
 			DLOG_ERR("Failed to erase boot-count log MTD; ioctl() MEMERASE returned %i",
 				 ret);
 
-			retval = -3;
+			retval = -4;
 			goto out;
 		}
 
 		i = 0;
+		page_len = 1;
+		erase_start = 0;
+		curr = (struct bootcounter *)page;
+	}
+	else {
+		erase_info.start = erase_start;
+		erase_info.length = erase_size;
+
+		ret = ioctl(fd, MEMERASE, &erase_info);
+		if (ret < 0) {
+			DLOG_ERR("Failed to erase boot-count log MTD; ioctl() MEMERASE returned %i",
+				 ret);
+
+			retval = -5;
+			goto out;
+		}
 	}
 
 	memset(curr, 0xff, bc_offset_increment);
@@ -165,11 +207,11 @@ int mtd_resetbc(const char *mtd)
 
 	/* Assumes bc_offset_increment is a multiple of mtd_info.writesize */
 
-	ret = pwrite(fd, curr, bc_offset_increment, i * bc_offset_increment);
+	ret = pwrite(fd, page, page_len * bc_offset_increment, erase_start);
 	if (ret < 0) {
 		DLOG_ERR("Failed to write boot-count log entry; pwrite() returned %i",
 			 errno);
-		retval = -4;
+		retval = -6;
 		goto out;
 
 	} else {
@@ -182,6 +224,9 @@ int mtd_resetbc(const char *mtd)
 	}
 
 out:
+	if (page) {
+		free(page);
+	}
 	close(fd);
 	return retval;
 }
